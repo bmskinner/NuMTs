@@ -1,0 +1,12 @@
+mapped_reads/
+.Rproj.user
+Dog cancer Part II report/
+fastq/
+filtered_reads/
+logs/
+trimmed_reads/
+NuMTs.Rproj
+SraRunTable.txt
+Filtered_samples.all.csv
+.RData
+.Rhistory
