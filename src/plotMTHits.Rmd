@@ -1,0 +1,273 @@
+---
+title: "Read mitochondrial hit data from SAM files"
+author: "Ben Skinner"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+---
+
+```{r setup, results='hide',message=F, warning=F, echo=F}
+library(knitr)
+knitr::opts_chunk$set(
+	dev = "png",
+	dev.args = list(type = "cairo"),
+	dpi = 300
+)
+```
+
+## Load libraries
+
+```{r message=FALSE}
+library(dplyr)
+library(ggplot2)
+# source("https://bioconductor.org/biocLite.R")
+# biocLite("GenomicRanges")
+# biocLite("ggbio")
+library(GenomicRanges)
+library(ggbio)
+```
+
+## Load the reference genome
+
+```{r}
+# Pig genome data
+chrnames   = c(1:18, "X", "Y")
+chrlengths = c(274330532, 151935994, 132848913, 130910915, 104526007, 170843587, 121844099, 138966237, 139512083, 69359453, 79169978, 61602749, 208334590, 141755446, 140412725, 79944280, 63494081, 55982971, 125939595, 43547828)
+names(chrlengths) = chrnames
+ref.genome = GRanges(chrnames, IRanges(1, chrlengths))
+```
+
+```{r}
+breeds = c("Duroc", "Berkshire", "Landrace")
+```
+
+
+## Find shared insertions in breed data
+
+In order to combine hits within a general region, the read coordinates are extended by 16kb in either direction.
+
+The goal here is to combine all sequence intervals across all animals into a single list of unique regions of the genome in which MT pairs were found. The number of animals with a hit in each of these regions is then counted. Only regions occurring in at least 60% of the animals is considered a possible 'real' hit.
+
+```{r}
+findSharedInsertions = function(breed){
+  
+  cat("Running on", breed,"\n")
+  
+  ## Load data files and reference genome
+  dir = paste0("Y:/bms41/Pigs/NuMTs/filtered_reads/",breed,"/")
+  files = list.files(dir, pattern=".*.filt.MT.sam", all.files=F, full.names=T)
+  
+  ## Read the files to sequence objects
+  readSamFile = function(file){
+    
+    
+    data = tryCatch({
+        read.csv(file, skip=1, header=F, stringsAsFactors = F, sep="\t")
+      }, error=function(cond){
+        message(paste("Cannot read ", file))
+        message("Original error message:")
+        message(cond)
+        return(NA)
+      })
+    locs = data %>% select("Flag"=V2, V3, V4, V7, V8, V10) %>% filter(V3=="MT"| V7=="MT")
+    
+    r1 = locs %>% 
+      filter(V3=="MT") %>% 
+      select(Flag, "MT_pos" = V4,"Chr"=V7,"Chr_pos"=V8, "Seq"=V10  ) %>%
+      mutate("ChrStrand" = ifelse(Flag&32, "-", "+"))  # flag 32 for next read is reverse complemented
+    
+    
+    
+    r2 = locs %>% filter(V3!="MT") %>% select(Flag, "MT_pos" = V8,"Chr"=V3,"Chr_pos"=V4, "Seq"=V10  ) %>%
+      mutate("ChrStrand" = ifelse(Flag&16, "-", "+")) # flag 16 for first read is reverse complemented
+    
+    mge = rbind(r1, r2) %>% mutate(TLen = nchar(Seq)) %>% select(-Seq)
+    
+
+    
+
+    
+    min.reads = 10
+    all.reads = with(mge, GRanges(Chr, IRanges(Chr_pos, Chr_pos+TLen)))
+    seqlevels(all.reads) = chrnames
+    seqlengths(all.reads) = chrlengths
+    
+    # Combine to overlapping regions
+    seqs = reduce(all.reads)
+    # Find the number of reads in each unique range within the sample
+    cat("Testing", length(seqs),"unique ranges; ")
+    chr.reads = split(all.reads, seqnames(all.reads))
+
+    findReadsWithCoverage = function(i){
+      combined.range = seqs[i]
+      chr = unique(seqnames(combined.range))
+      hits = sum(countOverlaps(chr.reads[[chr]], combined.range))
+      return(hits>min.reads)
+    }
+    
+    valid.reads = lapply(1:length(seqs), findReadsWithCoverage)
+    
+    
+    final.reads = seqs[valid.reads==TRUE]
+    
+    plotGr = function(seqname){
+      g = ggbio()+geom_rect(final.reads[seqname], main=paste(file, seqname))
+      ggsave(file=paste0(file, "_", seqname, ".png"))
+    }
+    lapply(unique(seqnames(final.reads)), plotGr)
+    
+    cat("Found", length(final.reads),"ranges with at least",min.reads,"reads\n")
+    seqlevels(final.reads) = chrnames
+    seqlengths(final.reads) = chrlengths
+    final.reads
+  }
+  
+  seqs = lapply(files, readSamFile)
+  
+  seqs = na.omit(seqs)
+  
+  
+  # Calculate overlaps
+  uniqueGranges = function(list){
+    result = list[[1]]
+    
+    for(ranges in list){
+      
+      result = c(result, ranges)
+    }
+    result = reduce(result)
+    cat("Found", length(result),"unique ranges\n")
+    result
+  }
+  
+  unique.ranges = uniqueGranges(seqs)
+  
+  presentInAtLeast = function(list, unique.ranges, percent){
+    
+    min.overlaps = (length(list) * percent)/100
+    cat("Looking for at least", min.overlaps, "overlaps for each range\n")
+    
+    countOverlappingGRanges = function(test.range){countOverlaps(unique.ranges, test.range ) }
+    
+    # Find the overlapping ranges
+    overlaps = lapply(list, countOverlappingGRanges)
+    
+    processList = function(list){
+      count = rep(0, length(list[[1]]))
+      
+      for(l in list){
+        count = mapply(sum, count, l)
+      }
+      count
+    }
+    
+    # count the overlapping ranges
+    totals = processList(overlaps)
+    
+    # filter by count
+    filterCounts = function(count){ count>min.overlaps }
+    
+    keeps = filterCounts(totals)
+    
+    # Create a result variable by subsetting the first range in the list
+    result = unique.ranges[1]
+    
+    for(i in 1:length(unique.ranges)){
+      if(keeps[[i]]){
+        result = c(result, unique.ranges[i])
+      }
+    }
+    # First row was a placeholder, remove unless in the keep list
+    if(!keeps[[1]]){ result = result[2:length(result)]  }
+    cat("Found", length(result),"ranges in at least", percent,"% of the samples\n")
+    result
+  }
+  
+  shared.ranges = presentInAtLeast(seqs, unique.ranges, 60)
+  shared.ranges
+}
+
+inserts = lapply(breeds, findSharedInsertions)
+
+```
+
+## Plot
+
+Plot each of the breed insert data
+
+```{r warning=FALSE}
+g = ggbio() + circle(ref.genome, geom = "ideo", fill = "gray70")
+for(s in inserts){
+  g = g + circle(s, geom = "rect", color = "steelblue", size=1)
+}
+g = g +
+  # circle(shared.ranges, geom = "rect", color = "red", size=2) +
+  circle(ref.genome, geom = "scale", size = 2)+
+  circle(ref.genome, geom = "text", aes(label = seqnames), vjust = 0, size = 3)
+g
+
+```
+
+## Data
+
+Visualise the aggregate hits
+
+```{r results='asis'}
+
+for(s in inserts){
+  df = data.frame(chr=seqnames(s),
+                  start=start(s)-1L,
+                  end=end(s))
+  
+  print(kable(df, caption = "MT hit table"))
+}
+
+```
+
+
+## Plot individual reads per animal
+
+
+```{r fig.height=3, fig.show='asis'}
+
+plotAnimalInsertions = function(breed){
+  
+  cat("Running on", breed,"\n")
+  
+  ## Load data files and reference genome
+  dir = paste0("Y:/bms41/Pigs/NuMTs/filtered_reads/",breed,"/")
+  files = list.files(dir, pattern=".*.filt.MT.sam", all.files=F, full.names=T)
+  
+  ## Read the files to sequence objects
+  readSamFile = function(file){
+    
+    cat("Reading", file,"\n")
+    data = read.csv(file, skip=1, header=F, stringsAsFactors = F, sep="\t")
+    locs = data %>% select(V3, V4, V7, V8, V10) %>% filter(V3=="MT"| V7=="MT")
+    
+    r1 = locs %>% filter(V3=="MT") %>% select("MT_pos" = V4,"Chr"=V7,"Chr_pos"=V8, "Seq"=V10  )
+    r2 = locs %>% filter(V3!="MT") %>% select("MT_pos" = V8,"Chr"=V3,"Chr_pos"=V4, "Seq"=V10  )
+    
+    mge = rbind(r1, r2) %>% mutate(TLen = nchar(Seq)) %>% select(-Seq)
+    
+    reads = with( mge, GRanges(Chr, IRanges( Chr_pos, Chr_pos+TLen)) )
+    seqlevels(reads) = chrnames
+    seqlengths(reads) = chrlengths
+    grl = split(reads, seqnames(reads), drop=T) #split by chr
+    
+    plotGr = function(seqname){
+      ggbio()+geom_rect(grl[seqname], main=paste(file, seqname))
+    }
+    plots = lapply(unique(seqnames(grl)), plotGr)
+    
+    for(p in plots){
+      print(p)
+    }
+  }
+  
+  # lapply(files, readSamFile)
+  
+    
+}
+
+plotAnimalInsertions(breeds)
+
+```

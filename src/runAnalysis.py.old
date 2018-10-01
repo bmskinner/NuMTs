@@ -1,0 +1,705 @@
+#!/usr/bin/env python 
+
+from collections import OrderedDict
+from datetime import datetime
+from joblib import Parallel, delayed
+import argparse
+import errno
+import functions
+import glob
+import logging
+import multiprocessing
+import os
+import os.path
+import pickle
+import Queue
+import re
+import signal
+import subprocess
+import sys
+import time
+from Pipeline import CommandFactory, AbstractParallelMethod, Pipeline
+
+__version__ = 'v01'
+
+logger_name = "analysis"
+
+class Sample:
+    '''Class to hold sample data and simplify access to 
+       folders
+    '''
+    _sra_acc = ""
+    _breed = ""
+    _sex = ""
+    _mbases = ""
+
+    def __init__(self, sra, breed, sex, mbases):
+        self._sra_acc = sra
+        self._breed = breed
+        self._sex = sex
+        self._mbases = mbases
+
+    def getAccession(self):
+        return self._sra_acc
+
+    def getLogFile(self, suffix):
+        return args.basedir + ("logs/%s.%s.log" % (self._sra_acc, suffix))
+
+    def has_file(self, file):
+        return os.path.isfile(file) and os.path.getsize(file)>0
+
+    def getFastqFolder(self):
+        return (args.basedir+"fastq/"+self._breed+"/")
+
+    def getFastqRead1(self):
+        return (self.getFastqFolder()+self._sra_acc+"_1.fastq.gz")
+
+    def getFastqRead2(self):
+        return (self.getFastqFolder()+self._sra_acc+"_2.fastq.gz")
+
+    def hasFastqFiles(self):
+        return self.has_file(self.getFastqRead1()) and self.has_file(self.getFastqRead2())
+
+    def getTrimmedReadFolder(self):
+        return (args.basedir+"trimmed_reads/"+self._breed+"/")
+
+    def getTrimmedRead1(self):
+        return (self.getTrimmedReadFolder()+self._sra_acc+"_1_val_1.fq.gz")
+
+    def getTrimmedRead2(self):
+        return (self.getTrimmedReadFolder()+self._sra_acc+"_2_val_2.fq.gz")
+
+    def hasTrimmedReads(self):
+        return self.has_file(self.getTrimmedRead1()) and self.has_file(self.getTrimmedRead2())
+
+    def getMappedReadFolder(self):
+        return (args.basedir+"mapped_reads/"+self._breed+"/")
+
+    def getMappedReadFile(self):
+        return (self.getMappedReadFolder()+self._sra_acc+".sam")
+
+    def hasMappedReads(self):
+        return self.has_file(self.getMappedReadFile())
+
+    def getBamFile(self):
+        return (self.getMappedReadFolder()+self._sra_acc+".bam")
+
+    def hasBamFile(self):
+        return self.has_file(self.getBamFile())
+
+    def getSortedBamFile(self):
+        return (self.getMappedReadFolder()+self._sra_acc+".sorted.bam")
+
+    def hasSortedBamFile(self):
+        return self.has_file(self.getSortedBamFile())
+
+    def getBamStatsFile(self):
+        return (self.getMappedReadFolder()+self._sra_acc+".bam.bas")
+
+    def hasBamStatsFile(self):
+        return self.has_file(self.getBamStatsFile())
+
+    def getFilteredReadFolder(self):
+        return (args.basedir+"filtered_reads/"+self._breed+"/")
+
+    def getFilteredReadFile(self):
+        return (self.getFilteredReadFolder()+self._sra_acc+".filt.MT.reheader.bam")
+
+    def hasFilteredReadFile(self):
+        return self.has_file(self.getFilteredReadFile())
+
+    def __unicode__(self):
+        return ('Accession %s: %s %s %s' % (self._sra_acc, self._breed, self._sex, self._mbases))
+        
+    def __str__(self):
+        return unicode(self).encode('utf-8')
+
+    def __repr__(self):
+        return str(self)
+
+class BwaFactory(CommandFactory):
+    '''Generate command line call to bwa
+    '''
+    def __init__(self, genome, n_threads=1, memory=8):
+        CommandFactory.__init__(self, args.basedir, n_threads, memory, "map")
+        self._genome = genome
+
+    def make_cmd(self, s):
+        ''' get the run command for the given sample
+
+            The verbosity is set to 0 - no output. Excess verbosity (default 3) causes /tmp/slurmd.log overflow
+            Setting -v from 0-2 has no effect on the logging to console - as documentation says, 'This option has not been fully supported throughout BWA'
+        '''
+        return (' bwa mem -v 1 -t %s %s "%s" "%s"  ' 
+            % (self.threads(), self._genome, s.getTrimmedRead1(), s.getTrimmedRead2())) #> "%s" removed due to test in sdout() below , s.getMappedReadFile()
+
+    def has_output(self, s):
+        return s.hasMappedReads() or s.hasBamFile()
+
+    def has_input(self, s):
+        return s.hasTrimmedReads()
+
+    def stdout(self, s):
+        ''' WARNING: don't muck about with this sdout redirection.
+            The following (conventional) command can drain a node by filling /tmp/slurmd.log:
+            srun -c 8  --mem=40G  -e logfile.log  bwa mem -v 1 -t 8 genome.file fq1 fq2 > mapped.sam
+
+            To prevent this, we redirect sdout via slurm to the SAM file:
+            --mem=40G -o mapped.sam -e logfile.log  bwa mem -v 1 -t 8 genome.file fq1 fq2
+        '''
+        return s.getMappedReadFile()
+
+    def __str__(self):
+        return "read mapping"
+
+class TrimFactory(CommandFactory):
+    ''' Generate command line calls to trim galore
+    '''
+
+    def __init__(self, n_threads=1, memory=8):
+        CommandFactory.__init__(self, args.basedir, n_threads, memory, "trim")
+
+    def make_cmd(self, s):
+        ''' get the trim command for the given sample
+        '''
+        return (' trim_galore --gzip --paired --fastqc --fastqc_args "--nogroup --extract" --output_dir "%s" "%s" "%s" ' 
+            % (s.getTrimmedReadFolder(), s.getFastqRead1(), s.getFastqRead2()))
+
+    def has_output(self, s):
+        return s.hasTrimmedReads() or s.hasMappedReads() or s.hasBamFile()
+
+    def has_input(self, s):
+        return s.hasFastqFiles()
+
+    def __str__(self):
+        return "trimming"
+
+class DownloadFactory(CommandFactory):
+    ''' Generate command line calls to download SRA fastq files
+    '''
+
+    def __init__(self, n_threads=1, memory=4):
+        CommandFactory.__init__(self, args.basedir, n_threads, memory, "dl")
+
+    def make_cmd(self, s):
+        ''' get the download command for the given sample
+        '''
+        return "/usr/bin/Rscript %ssrc/downloadSRA.R %s %s %s " % (args.basedir, args.basedir, s.getAccession(), s._breed)
+
+    def has_output(self, s):
+        return s.hasFastqFiles() or s.hasTrimmedReads() or s.hasMappedReads() or s.hasBamFile()
+
+    def has_input(self, s):
+        return True # default, first step in pipeline
+
+    def __str__(self):
+        return "downloading"
+
+class BamCompressFactory(CommandFactory):
+    ''' Generate command line calls to run BWA mapping
+    '''
+
+    def __init__(self, n_threads=8, memory=40):
+        CommandFactory.__init__(self, args.basedir, n_threads, memory, "bam")
+
+    def make_cmd(self, s):
+        ''' get the conversion command for the given sample
+
+            NOTE: The default samtools process would be to pipe the view
+            output to sort; i.e. samtools view -bS <reads> | samtools sort -o <bamfile> ' 
+            If this is run directly, srun only applies to the first samtools view command.
+            The sorting will be run on the initiating node directly.
+    
+            view
+                -b - compress to bam. 
+                -S - legacy identifing input as SAM.  Compatability with old versions
+                -@ - the number of threads is fixed at 2; more than this has no improvement
+            Pipe the output to:
+            sort 
+                -T - PREFIX for temporary files to avoid filename collision with parallel instances;
+                     mapped_read_folder/sample_accession.nnnn.bam
+                -@ - number of threads
+                -o - output file
+        '''
+        return ('samtools view -@ 2 -bS -o %s  %s ' 
+            % (s.getBamFile(), s.getMappedReadFile()) )
+
+    def has_output(self, s):
+        return s.hasBamFile()
+
+    def has_input(self, s):
+        return s.hasMappedReads()
+
+    def stdout(self, s):
+        return ""
+
+    def __str__(self):
+        return "compressing"
+
+class BamSortFactory(CommandFactory):
+    def __init__(self, n_threads=8, memory=40):
+        CommandFactory.__init__(self, args.basedir, n_threads, memory, "bam")
+
+    def make_cmd(self, s):
+        ''' get the conversion command for the given sample
+
+            NOTE: The default samtools process would be to pipe the view
+            output to sort; i.e. samtools view -bS <reads> | samtools sort -o <bamfile> ' 
+            If this is run directly, srun only applies to the first samtools view command.
+            The sorting will be run on the initiating node directly.
+    
+            view
+                -b - compress to bam. 
+                -S - legacy identifing input as SAM.  Compatability with old versions
+                -@ - the number of threads is fixed at 2; more than this has no improvement
+            Pipe the output to:
+            sort 
+                -T - PREFIX for temporary files to avoid filename collision with parallel instances;
+                     mapped_read_folder/sample_accession.nnnn.bam
+                -@ - number of threads
+                -o - output file
+        '''
+        return ('samtools sort -T %s -@ %s -o %s  %s ' 
+            % (s.getMappedReadFolder()+s.getAccession(), self.threads(), s.getSortedBamFile(), s.getBamFile()))
+
+    def has_output(self, s):
+        return s.hasSortedBamFile()
+
+    def has_input(self, s):
+        return s.hasBamFile()
+
+    def stdout(self, s):
+        return ""
+
+    def __str__(self):
+        return "sorting"
+
+class BamStatsFactory(CommandFactory):
+    ''' Generate command line calls to generate BWA statistics
+    '''
+    def __init__(self, n_threads=8, memory=40):
+        CommandFactory.__init__(self, args.basedir, n_threads, memory, "bas")
+
+    def make_cmd(self, s):
+        ''' bam_stats.pl -i SRR5337620.bam -o SRR5337620.bam.bas
+        '''
+        return (' bam_stats.pl -i %s -o %s ' 
+            % (s.getBamFile(), s.getBamStatsFile()))
+
+    def has_output(self, s):
+        return s.getBamStatsFile()
+
+    def has_input(self, s):
+        return s.getBamFile()
+
+    def __str__(self):
+        return "calculating stats"
+
+class ReadExtractionFactory(CommandFactory):
+    ''' Generate command line calls to extract read pairs with one read in the MT
+        and the other read elsewhere in the genome. Example commands:
+
+            samtools view -h -F 14 SRR5337620.bam | awk '($3!=$7 && $7!="=")' > SRR5337620.filt.sam
+            awk '{$3=="MT" || $7=="MT"}' SRR5337620.filt.sam > SRR5337620.filt.MT.sam
+            samtools view -b SRR5337620.filt.MT.sam > SRR5337620.filt.MT.bam
+            samtools reheader SRR5337620.filt.sam SRR5337620.filt.MT.bam > SRR5337620.filt.MT.reheader.bam
+    '''
+    def __init__(self, n_threads=8, memory=40):
+        CommandFactory.__init__(self, args.basedir, n_threads, memory, "rex")
+
+    def make_cmd(self, s):
+        '''
+        '''
+        awk1 = " awk '($3!=$7 && $7!=\"=\")' > %s " % (s.getFilteredReadFolder()+s.getAccession()+".filt.sam")
+        # awk2 = " awk '{$3==\"MT\" || $7==\"MT\"}' %s > %s " % (s.getFilteredReadFolder()+s.getAccession()+".filt.sam", s.getFilteredReadFolder()+s.getAccession()+".filt.MT.sam")
+        awk2 = " grep \"MT\" %s > %s " % (s.getFilteredReadFolder()+s.getAccession()+".filt.sam", s.getFilteredReadFolder()+s.getAccession()+".filt.MT.sam")
+
+        sam1 = " samtools view -b %s > %s " % ( s.getFilteredReadFolder()+s.getAccession()+".filt.MT.sam", s.getFilteredReadFolder()+s.getAccession()+".filt.MT.bam" )
+        sam2 = " samtools reheader %s %s > %s " % (s.getFilteredReadFolder()+s.getAccession()+".filt.sam", s.getFilteredReadFolder()+s.getAccession()+".filt.MT.bam", s.getFilteredReadFile())
+
+        return (" samtools view -h -F 14 %s | %s ; %s ; %s ; %s "
+            % (s.getSortedBamFile(), awk1, awk2, sam1, sam2))
+
+    def has_output(self, s):
+        return s.hasFilteredReadFile()
+
+    def has_input(self, s):
+        return s.getSortedBamFile()
+
+    def stdout(self, s):
+        ''' Override otherwise the output will go to the log.
+            Using "" so srun will not divert from console.
+        '''
+        return ""
+
+    def __str__(self):
+        return "extracting MT reads"
+
+# def format_seconds(sec):
+#     days = sec // 86400
+#     hours = sec // 3600 % 24
+#     minutes = sec // 60 % 60
+#     seconds = sec % 60
+#     return("%dd %dh %dm %ds" % (days, hours, minutes, seconds))
+
+# def _run(s, runner):
+#     ''' Run the commands generated by a command factory for the given sample
+
+#         This method must be accessible from the module namespace for the multiprocessing
+#         pool to access it
+
+#         --s the Sample to run
+#         --runner the command factory
+#     '''
+#     try:
+#         if(runner.has_output(s)):
+#             logger.debug("Output files of %s exists for %s, skipping" % (str(runner), s.getAccession()))
+#             return
+#         if(not runner.has_input(s)):
+#             logger.debug("Missing input files of %s for %s, skipping" % (str(runner), s.getAccession()))
+#             return
+
+#         start = time.time()
+#         sdout_str = (", directing sdout to %s" % runner.stdout(s)) if runner.stdout(s) else ""
+#         sderr_str = (", directing sderr to %s" % runner.stderr(s)) if runner.stderr(s) else ""
+#         logger.info("Running %s on sample %s%s%s" % (str(runner), s.getAccession(), sdout_str, sderr_str) )
+#         if(args.test):
+#             logger.debug("Would run: %s" % runner.make_cmd(s))
+#         else:
+#             functions.srun(cmd=runner.make_cmd(s), ncores=runner.threads(), mem=runner.memory(), sdout=runner.stdout(s), sderr=runner.stderr(s), exclusive=runner.exclusive())
+#         end = time.time()
+#         logger.info("Completed %s %s in %s" % (str(runner), s.getAccession(), format_seconds(end-start)))
+#         return
+#     except:
+#         e = sys.exc_info()[0]
+#         logger.exception("Error running %s on sample %s" % (str(runner), s.getAccession()) )
+
+# class AbstractParallelMethod():
+#     ''' Class to perform abstract parallel methods
+#         on samples via a multiprocess pool.
+
+#         When jobs are submitted to the cluster, ensure not 
+#         all the nodes are filled. Maintain an internal task queue
+#         which keeps <ninstances> srun jobs populated.
+#     '''  
+#     _is_test = False  # is this a test run
+#     _ninstances = 1   # the number of parallel instances in the pool
+#     _base_method = "" # the method to run in the pool; must be accessible from the module namespace
+#     _out_folder = ""  # the ouput folder for the analysis
+#     _runner = ""      # the Factory that will generate commands to be executed for each sample
+
+#     def __init__(self, instances=1, test=False, method=None, out_folder=None, runner=None):
+#         self._is_test = test
+#         self._ninstances = instances
+#         if(method==None):
+#             self._base_method = self._run
+#         else:
+#             self._base_method = method
+#         # self._base_method = method if method not None else self._run
+#         self._out_folder = out_folder
+#         self._runner = runner
+
+#     def create_output_folders(self, samples):
+#         ''' Create a sub folder for each unique breed in the samples
+#             samples - the samples
+#             top_level_dir - the directory in which to create the breed folders
+#         '''
+#         top_level_dir = functions.slash_terminate(args.basedir+self._out_folder)
+#         logger.debug("Creating output folders for directory %s" % top_level_dir)
+
+#         if(self._is_test):
+#             logger.debug("Would create output folder %s" % top_level_dir)
+#         else:
+#             functions.make_sure_path_exists(top_level_dir)
+        
+#         breeds = set(map(lambda s: s._breed, samples)) # get distinct breeds
+#         for b in breeds:
+#             b_folder = top_level_dir+b+"/"
+#             if(self._is_test):
+#                 logger.debug("Would create output folder %s" % b_folder)
+#             else:
+#                 functions.make_sure_path_exists(b_folder)
+
+#     def worker_function(self, job_queue):
+#         ''' A worker for the substitute multiprocessing pool
+
+#             Takes a job from the queue and executes with the class command factory
+#         '''
+#         signal.signal(signal.SIGINT, signal.SIG_IGN)
+#         while not job_queue.empty():
+#             try:
+#                 s = job_queue.get(block=False)
+#                 self._base_method(s, self._runner)
+#             except Queue.Empty:
+#                 pass
+
+#     def run(self, samples):
+#         self.create_output_folders(samples)
+
+#         # OLD METHOD
+#         # There is an issue with using a worker pool; worker processes can handle the KeyboardInterrupt and call sys.exit, 
+#         # but the processes persist and still receive future tasks. 
+#         # Additionally, the KeyboardInterrupt is not delivered to the parent process until all jobs are completed.
+#         # This means Ctrl-C will only add the next worker into slurm; it will not cancel all the jobs
+#         # See here for possible solution: https://bryceboe.com/2010/08/26/python-multiprocessing-and-keyboardinterrupt/
+
+        
+#         # _pool = multiprocessing.Pool(processes=self._ninstances) # pool must be global
+#         # logger.info("Running %s on %d samples" % (str(self._runner), len(samples)))
+#         # logger.debug("Invoking apply_async with %d processes" % self._ninstances)
+
+#         # try:
+#         #     for s in samples:
+#         #         _pool.apply_async(self._base_method, args=(s,self._runner))
+#         # except KeyboardInterrupt:
+#         #     logger.debug("Caught KeyboardInterrupt, terminating workers and quitting")
+#         #     _pool.terminate()
+#         #     logger.warn("Script interrupted; manual file cleanup may be needed")
+#         #     sys.exit(1)
+#         # else:
+#         #     _pool.close()
+#         #     _pool.join()
+#         #     logger.debug("Worker pool closed normally")
+
+#         # NEW METHOD
+#         # Given the problem with the old method above, here we implement a custom 
+#         # job queue and worker pool that can respond to keyboard interrupts. It's 
+#         # not perfect - anything sent to slurm before the interrupt will keep running,
+#         # but no new jobs will be submitted, and the script will exit.
+#         job_queue = multiprocessing.Queue()
+
+#         logger.info("Running %s on %d samples" % (str(self._runner), len(samples)))
+#         logger.debug("Invoking %d workers" % self._ninstances)
+
+#         for s in samples:
+#             job_queue.put(s)
+
+#         workers = []
+#         for i in range(self._ninstances):
+#             tmp = multiprocessing.Process(target=self.worker_function,
+#                                           args=(job_queue,))
+#             tmp.start()
+#             workers.append(tmp)
+
+#         try:
+#             for worker in workers:
+#                 worker.join()
+#             logger.debug("Worker pool closed normally")
+#         except KeyboardInterrupt:
+#             for worker in workers:
+#                 worker.terminate()
+#                 worker.join()
+#             logger.warn("Script interrupted; manual file cleanup may be needed")
+#             logger.warn("Continuing jobs already submitted to slurm")
+#             sys.exit(1)
+#         logger.info("Finished %s" % str(self._runner))
+
+#     def _run(self, s, runner):
+#         ''' Run the commands generated by a command factory for the given sample
+#             --s the Sample to run
+#             --runner the command factory
+#         '''
+#         try:
+#             if(runner.has_output(s)):
+#                 logger.debug("Output files of %s exists for %s, skipping" % (str(runner), s.getAccession()))
+#                 return
+#             if(not runner.has_input(s)):
+#                 logger.debug("Missing input files of %s for %s, skipping" % (str(runner), s.getAccession()))
+#                 return
+
+#             start = time.time()
+#             sdout_str = (", directing sdout to %s" % runner.stdout(s)) if runner.stdout(s) else ""
+#             sderr_str = (", directing sderr to %s" % runner.stderr(s)) if runner.stderr(s) else ""
+#             logger.info("Running %s on sample %s%s%s" % (str(runner), s.getAccession(), sdout_str, sderr_str) )
+#             if(args.test):
+#                 logger.debug("Would run: %s" % runner.make_cmd(s))
+#             else:
+#                 functions.srun(cmd=runner.make_cmd(s), ncores=runner.threads(), mem=runner.memory(), sdout=runner.stdout(s), sderr=runner.stderr(s), exclusive=runner.exclusive())
+#             end = time.time()
+#             logger.info("Completed %s %s in %s" % (str(runner), s.getAccession(), format_seconds(end-start)))
+#             return
+#         except:
+#             e = sys.exc_info()[0]
+#             logger.exception("Error running %s on sample %s" % (str(runner), s.getAccession()) )
+
+class Downloader(AbstractParallelMethod):
+    ''' Method to download fastq files from EBI. 
+        Uses single instance pool to avoid saturating connection
+    '''
+    def __init__(self, instances, test):
+        # AbstractParallelMethod.__init__(self, 1, test=test, method=_run, out_folder="fastq/", runner=DownloadFactory())
+        AbstractParallelMethod.__init__(self, instances=1, test=test, out_folder="fastq/", runner=DownloadFactory())
+
+class Trimmer(AbstractParallelMethod):
+    '''Class to perform trimming of fastq data
+        Run the read trimming through srun. Ignores samples with existing trimmed reads.
+
+        Note that class instances cannot be pickled using the default multiprocessing
+        package, so the method dispatched to the pool must be accessible from this module.
+        Possible to switch to pathos.multiprocessing for future encapsulation. 
+        See: https://stackoverflow.com/questions/1816958/cant-pickle-type-instancemethod-when-using-multiprocessing-pool-map
+    '''
+    def __init__(self, instances, test):
+        AbstractParallelMethod.__init__(self, instances=instances, test=test, out_folder="trimmed_reads/", runner=TrimFactory(n_threads=8, memory=40))
+
+class Mapper(AbstractParallelMethod):
+    '''Class to perform mapping of reads
+    '''  
+    def __init__(self, instances, test):
+        AbstractParallelMethod.__init__(self, instances=instances, test=test, out_folder="mapped_reads/", runner=BwaFactory(genome="/mnt/cgs-fs3/Sequencing/Genome/Sscrofa11.1/bwa/Sus_scrofa.Sscrofa.11.1.dna.fa", n_threads=8, memory=40))
+
+class BamCompressor(AbstractParallelMethod):
+    '''Class to perform conversion of sam to bam
+    '''  
+    def __init__(self, instances, test):
+        AbstractParallelMethod.__init__(self, instances=instances, test=test, out_folder="mapped_reads/", runner=BamCompressFactory(n_threads=8, memory=40))
+
+class BamSorter(AbstractParallelMethod):
+    '''Class to perform conversion of sam to bam
+    '''  
+    def __init__(self, instances, test):
+        AbstractParallelMethod.__init__(self, instances=instances, test=test, out_folder="mapped_reads/", runner=BamSortFactory(n_threads=8, memory=40))
+
+class StatsCalculator(AbstractParallelMethod):
+    '''Class to perform conversion of sam to bam
+    '''  
+    def __init__(self, instances, test):
+        AbstractParallelMethod.__init__(self, instances=instances, test=test, out_folder="mapped_reads/", runner=BamStatsFactory(n_threads=8, memory=40))
+
+class ReadExtractor(AbstractParallelMethod):
+    ''' Get read pairs that map to MT on only one read
+    '''
+    def __init__(self, instances, test):
+        AbstractParallelMethod.__init__(self, instances=8, test=test, out_folder="filtered_reads/", runner=ReadExtractionFactory(n_threads=1, memory=10))
+
+# class Pipeline:
+#     '''Simplify running of each method in the analyis by chaining them into a pipeline
+#     '''
+
+#     _methods = OrderedDict() # store methods in the order they were inserted
+#     _ninstances = 1
+#     _is_test = False
+
+#     def __init__(self, instances=1, test=False):
+#         self._ninstances = instances
+#         self._is_test = test
+
+#     def add_method(self, method_class, is_skip):
+#         '''Add a method to the pipeline
+
+#             The method is created from the given method class using the default constructor.
+
+#             --method_class - the class of the runnable AbstractParallelMethod to create
+#             --is_skip - true if the method should be skipped, false otherwise
+
+#             returns - the pipeline
+#         '''
+#         self._methods[method_class(self._ninstances, self._is_test)] = is_skip
+#         logger.debug("Added %s to pipeline; skip is %s" % (method_class.__name__, is_skip))
+#         return(self)
+
+#     def run(self, samples):
+#         '''Run the methods in the order they were added, if the
+#            method is not set to skip
+#         '''
+#         for method in self._methods.keys():
+#             if(self._methods[method]):
+#                 logger.info("Skipping %s" % method.__class__.__name__)
+#             else:
+#                 method.run(samples)
+
+def create_logger():
+    '''Configure the logger. 
+
+    Use a log file to store all messages of level DEBUG 
+    or higher. Send all messages of level INFO or higher
+    to sdout.
+    '''
+    logger = logging.getLogger(logger_name)
+    logger.setLevel(logging.DEBUG)
+
+
+    functions.make_sure_path_exists(args.basedir+"logs/")
+    logfile = datetime.now().strftime('analysis.%Y_%m_%d_%H_%M.log')
+    fh = logging.FileHandler(args.basedir+"logs/"+logfile)
+ 
+    formatter = logging.Formatter('%(asctime)s\t%(name)s\t%(funcName)s\t%(levelname)s\t%(message)s')
+    fh.setFormatter(formatter)
+    fh.setLevel(logging.DEBUG)
+    logger.addHandler(fh)
+
+    sh = logging.StreamHandler()
+    sh.setLevel(logging.INFO)
+    logger.addHandler(sh)
+
+    pipe_logger = logging.getLogger("Pipeline")
+    pipe_logger.setLevel(logging.DEBUG)
+    pipe_logger.addHandler(fh)
+    pipe_logger.addHandler(sh)
+
+    return(logger)
+
+def readSampleList():
+    logger.info("Reading sample file")
+
+    if( not os.path.isfile(args.sample_file)):
+        logger.error("Expected sample file %s is not present" % args.sample_file)
+        sys.exit(1)
+    sampleList = []
+    with open(args.sample_file, 'r') as f:
+        for line in f:
+            entry = line.strip().split("\t")
+            entry = [w.replace('"', '') for w in entry] # replace all quotes
+            if(entry[0]=="breed"): # skip header line
+                continue
+            sampleList.append( Sample(entry[6], entry[0], entry[7], entry[4]) )
+    logger.info("Read sample file of %d samples" % len(sampleList))
+    return(sampleList)
+                
+def runAnalysis():
+    '''Create and run the analysis pipeline
+    '''
+
+    # Read sample file to get breed folder and sample ids
+    samples = readSampleList()
+
+    pipeline = Pipeline(args.ninstances, args.test)
+
+    pipeline.add_method(Downloader, args.no_download).\
+        add_method(Trimmer, args.no_trim).\
+        add_method(Mapper,  args.no_map).\
+        add_method(BamCompressor,  args.no_convert).\
+        add_method(BamSorter,  args.no_convert).\
+        add_method(ReadExtractor, args.no_extract).\
+        run(samples)
+
+if __name__ == '__main__':
+    
+    parser = argparse.ArgumentParser(prog='runAnalysis.py',description = '')
+    parser.add_argument('-v', '--version', action='version', version='%(prog)s-'+__version__)
+    parser.add_argument('--basedir', 
+        help="Base directory for analysis",
+        default='./')
+    parser.add_argument('--ninstances', 
+        help="Number of parallel srun instances",
+        default=3, type=int)
+    parser.add_argument('--sample_file', 
+        help="List of samples to process",
+        default='./Filtered_samples.csv')
+    parser.add_argument('--test', help="Run in test mode only", action='store_true')
+    parser.add_argument('--no_download', help="Skip the download step", action='store_true')
+    parser.add_argument('--no_trim', help="Skip the trimming step", action='store_true')
+    parser.add_argument('--no_map', help="Skip the mapping step", action='store_true')
+    parser.add_argument('--no_convert', help="Skip the bam conversion", action='store_true')
+    parser.add_argument('--no_extract', help="Skip the MT read extraction", action='store_true')
+    args   = parser.parse_args()
+
+    logger = create_logger()
+    logger.info("Invoked with arguments: "+str(args))
+
+    # _pool = multiprocessing.Pool(processes=args.ninstances) # For parallel processes
+
+    logger.info("Running%sanalysis" % " test " if args.test else " ")
+    runAnalysis()
+    logger.info("Analysis complete")
+    sys.exit(0)
